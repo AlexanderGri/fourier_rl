@@ -28,6 +28,7 @@ class SACTrainer(TorchTrainer):
             optimizer_class=optim.Adam,
 
             soft_target_tau=1e-2,
+            spectrum_coef=1e-2,
             target_update_period=1,
             plotter=None,
             render_eval_paths=False,
@@ -43,6 +44,7 @@ class SACTrainer(TorchTrainer):
         self.target_qf1 = target_qf1
         self.target_qf2 = target_qf2
         self.soft_target_tau = soft_target_tau
+        self.spectrum_coef = spectrum_coef
         self.target_update_period = target_update_period
 
         self.use_automatic_entropy_tuning = use_automatic_entropy_tuning
@@ -82,7 +84,7 @@ class SACTrainer(TorchTrainer):
         self._n_train_steps_total = 0
         self._need_to_update_eval_statistics = True
 
-    def train_from_torch(self, batch):
+    def train_from_torch(self, batch, batch_traj):
         rewards = batch['rewards']
         terminals = batch['terminals']
         obs = batch['observations']
@@ -130,6 +132,16 @@ class SACTrainer(TorchTrainer):
         qf2_loss = self.qf_criterion(q2_pred, q_target.detach())
 
         """
+        Spectrum loss
+        """
+        obs_traj = batch_traj['observations']
+        new_actions_traj, *_ = self.policy(obs_traj, reparameterize=True, return_log_prob=True)
+        new_actions_traj = new_actions_traj.reshape(-1, 1000, new_actions_traj.shape[-1])
+        new_actions_traj = new_actions_traj.transpose(1, 2)
+        f = torch.rfft(new_actions_traj, 1)
+        amp_f = f[1:].norm(dim=-1)
+        spectrum_loss = amp_f.norm(p=1, dim=-1).mean()
+        """
         Update networks
         """
         self.qf1_optimizer.zero_grad()
@@ -141,7 +153,7 @@ class SACTrainer(TorchTrainer):
         self.qf2_optimizer.step()
 
         self.policy_optimizer.zero_grad()
-        policy_loss.backward()
+        (policy_loss + self.spectrum_coef * spectrum_loss).backward()
         self.policy_optimizer.step()
 
         """
@@ -170,6 +182,9 @@ class SACTrainer(TorchTrainer):
             self.eval_statistics['QF2 Loss'] = np.mean(ptu.get_numpy(qf2_loss))
             self.eval_statistics['Policy Loss'] = np.mean(ptu.get_numpy(
                 policy_loss
+            ))
+            self.eval_statistics['Spectrum Loss'] = np.mean(ptu.get_numpy(
+                spectrum_loss
             ))
             self.eval_statistics.update(create_stats_ordered_dict(
                 'Q1 Predictions',
